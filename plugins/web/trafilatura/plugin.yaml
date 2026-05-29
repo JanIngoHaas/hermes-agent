@@ -1,0 +1,7 @@
+name: web-trafilatura
+version: 1.0.0
+description: "Local HTML→Markdown web extraction via the trafilatura Python package — no API key required (extract-only; pair with any search provider). Install with `pip install trafilatura`."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - trafilatura

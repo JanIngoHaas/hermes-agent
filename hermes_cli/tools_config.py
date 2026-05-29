@@ -980,6 +980,27 @@ def _run_post_setup(post_setup_key: str):
         _print_info("    No API key required. DuckDuckGo enforces server-side rate limits.")
         _print_info("    Pair with an extract provider if you also need web_extract.")
 
+    elif post_setup_key == "trafilatura":
+        try:
+            __import__("trafilatura")
+            _print_success("    trafilatura is already installed")
+        except ImportError:
+            _print_info("    Installing trafilatura (HTML→Markdown extraction package)...")
+            try:
+                result = _pip_install(["-U", "trafilatura", "--quiet"], timeout=300)
+                if result.returncode == 0:
+                    _print_success("    trafilatura installed")
+                else:
+                    _print_warning("    trafilatura install failed:")
+                    _print_info(f"      {(result.stderr or '').strip()[:300]}")
+                    _print_info("    Run manually: uv pip install -U trafilatura")
+                    return
+            except subprocess.TimeoutExpired:
+                _print_warning("    trafilatura install timed out (>5min)")
+                _print_info("    Run manually: uv pip install -U trafilatura")
+                return
+        _print_info("    No API key required. Extract-only — pair with a search provider.")
+
     elif post_setup_key == "spotify":
         # Run the full `hermes auth spotify` flow — if the user has no
         # client_id yet, this drops them into the interactive wizard
