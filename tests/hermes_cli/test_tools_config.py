@@ -9,6 +9,7 @@ from hermes_cli.nous_account import NousPortalAccountInfo
 from hermes_cli.tools_config import (
     _DEFAULT_OFF_TOOLSETS,
     _apply_toolset_change,
+    _apply_web_backend_selection,
     _configure_provider,
     _reconfigure_provider,
     _get_platform_tools,
@@ -1241,3 +1242,65 @@ def test_reconfigure_provider_runs_post_setup_for_env_var_providers(
     _reconfigure_provider(provider, {})
 
     assert called == [post_setup_key]
+
+
+# ---------------------------------------------------------------------------
+# Per-capability web backend selection (ddgs + trafilatura preset)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_web_backend_selection_shared_backend():
+    """A 1:1 provider row still writes the shared web.backend key."""
+    config = {}
+    _apply_web_backend_selection({"web_backend": "firecrawl"}, config, None)
+    assert config["web"]["backend"] == "firecrawl"
+    assert config["web"]["use_gateway"] is False
+
+
+def test_apply_web_backend_selection_per_capability():
+    """A preset row writes per-capability keys and leaves shared backend alone."""
+    config = {"web": {"backend": "ddgs"}}  # stale shared backend present
+    _apply_web_backend_selection(
+        {"web_search_backend": "ddgs", "web_extract_backend": "trafilatura"},
+        config,
+        None,
+    )
+    assert config["web"]["search_backend"] == "ddgs"
+    assert config["web"]["extract_backend"] == "trafilatura"
+    # Shared backend must not be clobbered by a per-capability preset.
+    assert config["web"]["backend"] == "ddgs"
+
+
+def test_apply_web_backend_selection_noop_without_fields():
+    """No web-backend fields → no web config written."""
+    config = {}
+    _apply_web_backend_selection({"name": "Something Else"}, config, None)
+    assert "web" not in config
+
+
+def test_ddgs_trafilatura_preset_row_present_and_wires_both_keys():
+    """The combo preset row exists in the web picker and writes both keys."""
+    combo = next(
+        p
+        for p in TOOL_CATEGORIES["web"]["providers"]
+        if p["name"] == "DuckDuckGo + Trafilatura"
+    )
+    assert combo["web_search_backend"] == "ddgs"
+    assert combo["web_extract_backend"] == "trafilatura"
+    assert combo["post_setup"] == "ddgs+trafilatura"
+    assert combo["env_vars"] == []
+
+    config = {}
+    _apply_web_backend_selection(combo, config, None)
+    assert config["web"]["search_backend"] == "ddgs"
+    assert config["web"]["extract_backend"] == "trafilatura"
+
+
+def test_ddgs_trafilatura_preset_visible_in_picker():
+    """The preset renders as a row in the Web Search & Extract category."""
+    with patch("hermes_cli.tools_config.get_nous_subscription_features") as feats:
+        feats.return_value = SimpleNamespace(
+            account_info=None, nous_auth_present=False
+        )
+        rows = _visible_providers(TOOL_CATEGORIES["web"], {})
+    assert any(r.get("name") == "DuckDuckGo + Trafilatura" for r in rows)

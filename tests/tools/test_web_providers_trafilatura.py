@@ -183,3 +183,40 @@ class TestTrafilaturaRegistryIntegration:
             assert prov.supports_search() is False
         finally:
             _reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Integration: _is_backend_available / _get_extract_backend wiring
+# ---------------------------------------------------------------------------
+
+
+class TestTrafilaturaBackendWiring:
+    def test_is_backend_available_true_when_package_importable(self, monkeypatch):
+        from tools import web_tools
+        monkeypatch.setattr(web_tools, "_trafilatura_package_importable", lambda: True)
+        assert web_tools._is_backend_available("trafilatura") is True
+
+    def test_is_backend_available_false_when_package_missing(self, monkeypatch):
+        from tools import web_tools
+        monkeypatch.setattr(web_tools, "_trafilatura_package_importable", lambda: False)
+        assert web_tools._is_backend_available("trafilatura") is False
+
+    def test_configured_extract_backend_resolves_to_trafilatura(self, monkeypatch):
+        """web.extract_backend=trafilatura is honored when the package is present."""
+        from tools import web_tools
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"backend": "ddgs", "search_backend": "ddgs", "extract_backend": "trafilatura"},
+        )
+        monkeypatch.setattr(web_tools, "_trafilatura_package_importable", lambda: True)
+        assert web_tools._get_extract_backend() == "trafilatura"
+
+    def test_unavailable_extract_backend_falls_back(self, monkeypatch):
+        """If trafilatura isn't installed, extract selection falls back to shared backend."""
+        from tools import web_tools
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"backend": "firecrawl", "search_backend": "", "extract_backend": "trafilatura"},
+        )
+        monkeypatch.setattr(web_tools, "_trafilatura_package_importable", lambda: False)
+        assert web_tools._get_extract_backend() == "firecrawl"

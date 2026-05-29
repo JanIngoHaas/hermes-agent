@@ -308,6 +308,19 @@ TOOL_CATEGORIES = {
                     {"key": "FIRECRAWL_API_URL", "prompt": "Your Firecrawl instance URL (e.g., http://localhost:3002)"},
                 ],
             },
+            # Preset that pairs two free, no-API-key plugins into a complete
+            # search+extract setup: ddgs (search-only) + trafilatura
+            # (extract-only). Writes the per-capability keys via
+            # _apply_web_backend_selection(); post_setup installs both packages.
+            {
+                "name": "DuckDuckGo + Trafilatura",
+                "badge": "free · no key · search + extract",
+                "tag": "Free pair: DuckDuckGo search (ddgs) + local HTML→Markdown extract (trafilatura). No API keys.",
+                "env_vars": [],
+                "web_search_backend": "ddgs",
+                "web_extract_backend": "trafilatura",
+                "post_setup": "ddgs+trafilatura",
+            },
         ],
     },
     "image_gen": {
@@ -1000,6 +1013,31 @@ def _run_post_setup(post_setup_key: str):
                 _print_info("    Run manually: uv pip install -U trafilatura")
                 return
         _print_info("    No API key required. Extract-only — pair with a search provider.")
+
+    elif post_setup_key == "ddgs+trafilatura":
+        # Free search+extract pair — install both optional packages.
+        for pkg in ("ddgs", "trafilatura"):
+            try:
+                __import__(pkg)
+                _print_success(f"    {pkg} is already installed")
+                continue
+            except ImportError:
+                pass
+            _print_info(f"    Installing {pkg}...")
+            try:
+                result = _pip_install(["-U", pkg, "--quiet"], timeout=300)
+                if result.returncode == 0:
+                    _print_success(f"    {pkg} installed")
+                else:
+                    _print_warning(f"    {pkg} install failed:")
+                    _print_info(f"      {(result.stderr or '').strip()[:300]}")
+                    _print_info(f"    Run manually: uv pip install -U {pkg}")
+                    return
+            except subprocess.TimeoutExpired:
+                _print_warning(f"    {pkg} install timed out (>5min)")
+                _print_info(f"    Run manually: uv pip install -U {pkg}")
+                return
+        _print_info("    No API key required. DuckDuckGo search + local trafilatura extraction.")
 
     elif post_setup_key == "spotify":
         # Run the full `hermes auth spotify` flow — if the user has no
@@ -2562,6 +2600,34 @@ def _select_plugin_video_gen_provider(plugin_name: str, config: dict, *, use_gat
     _configure_videogen_model_for_plugin(plugin_name, config)
 
 
+def _apply_web_backend_selection(provider: dict, config: dict, managed_feature) -> None:
+    """Write a picked web provider's backend selection into ``config["web"]``.
+
+    Handles both the shared ``web_backend`` field (1:1 provider rows) and the
+    per-capability ``web_search_backend`` / ``web_extract_backend`` fields used
+    by preset rows that pair a search-only and an extract-only backend (e.g.
+    "DuckDuckGo + Trafilatura"). Per-capability keys take precedence over the
+    shared ``web.backend`` at dispatch time, so a preset can leave ``backend``
+    untouched and still route each capability correctly.
+    """
+    if not any(
+        provider.get(k)
+        for k in ("web_backend", "web_search_backend", "web_extract_backend")
+    ):
+        return
+    web_cfg = config.setdefault("web", {})
+    if provider.get("web_backend"):
+        web_cfg["backend"] = provider["web_backend"]
+        _print_success(f"  Web backend set to: {provider['web_backend']}")
+    if provider.get("web_search_backend"):
+        web_cfg["search_backend"] = provider["web_search_backend"]
+        _print_success(f"  Web search backend set to: {provider['web_search_backend']}")
+    if provider.get("web_extract_backend"):
+        web_cfg["extract_backend"] = provider["web_extract_backend"]
+        _print_success(f"  Web extract backend set to: {provider['web_extract_backend']}")
+    web_cfg["use_gateway"] = bool(managed_feature)
+
+
 def _configure_provider(
     provider: dict,
     config: dict,
@@ -2605,12 +2671,8 @@ def _configure_provider(
             _print_success(f"  Browser cloud provider set to: {bp}")
         browser_cfg["use_gateway"] = bool(managed_feature)
 
-    # Set web search backend in config if applicable
-    if provider.get("web_backend"):
-        web_cfg = config.setdefault("web", {})
-        web_cfg["backend"] = provider["web_backend"]
-        web_cfg["use_gateway"] = bool(managed_feature)
-        _print_success(f"  Web backend set to: {provider['web_backend']}")
+    # Set web search/extract backend(s) in config if applicable
+    _apply_web_backend_selection(provider, config, managed_feature)
 
     # For tools without a specific config key (e.g. image_gen), still
     # track use_gateway so the runtime knows the user's intent.
@@ -2968,12 +3030,8 @@ def _reconfigure_provider(
             _print_success(f"  Browser cloud provider set to: {bp}")
         browser_cfg["use_gateway"] = bool(managed_feature)
 
-    # Set web search backend in config if applicable
-    if provider.get("web_backend"):
-        web_cfg = config.setdefault("web", {})
-        web_cfg["backend"] = provider["web_backend"]
-        web_cfg["use_gateway"] = bool(managed_feature)
-        _print_success(f"  Web backend set to: {provider['web_backend']}")
+    # Set web search/extract backend(s) in config if applicable
+    _apply_web_backend_selection(provider, config, managed_feature)
 
     if managed_feature and managed_feature not in {"web", "tts", "browser"}:
         section = config.setdefault(managed_feature, {})
