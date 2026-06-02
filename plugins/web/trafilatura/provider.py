@@ -112,6 +112,16 @@ class TrafilaturaWebExtractProvider(WebSearchProvider):
         Raises on network/HTTP error (caught by the caller).
         """
         import httpx
+
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+
+            _lazy_ensure("search.trafilatura", prompt=False)
+        except ImportError:
+            pass
+        except Exception as exc:  # noqa: BLE001 — lazy_deps surfaces install hints
+            raise ImportError(str(exc))
+
         import trafilatura
 
         with httpx.Client(
