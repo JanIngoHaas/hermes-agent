@@ -220,3 +220,76 @@ class TestTrafilaturaBackendWiring:
         )
         monkeypatch.setattr(web_tools, "_trafilatura_package_importable", lambda: False)
         assert web_tools._get_extract_backend() == "firecrawl"
+
+
+# ---------------------------------------------------------------------------
+# _fetch_markdown — manual per-hop redirect SSRF validation
+# ---------------------------------------------------------------------------
+
+
+class TestFetchMarkdownRedirectSSRF:
+    """The real fetch path follows redirects manually and SSRF-checks each hop
+    *before* issuing the next request, so an internal address is never fetched.
+    """
+
+    def _patch_httpx(self, monkeypatch, handler):
+        import httpx
+
+        real_client = httpx.Client
+
+        def _client(**kwargs):
+            kwargs.pop("follow_redirects", None)
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        monkeypatch.setattr(httpx, "Client", _client)
+
+    def test_redirect_to_internal_is_blocked_before_body_read(self, monkeypatch):
+        import httpx
+        _force_available(monkeypatch, True)
+
+        def handler(request):
+            if request.url.path == "/redirector":
+                return httpx.Response(
+                    302, headers={"location": "http://169.254.169.254/latest/meta-data/"}
+                )
+            return httpx.Response(200, text="SECRET CREDS")  # must never be returned
+
+        self._patch_httpx(monkeypatch, handler)
+        monkeypatch.setattr(
+            "plugins.web.trafilatura.provider.is_safe_url",
+            lambda u: "169.254" not in u,
+        )
+        p = TrafilaturaWebExtractProvider()
+        with pytest.raises(RuntimeError, match="private or internal"):
+            p._fetch_markdown("https://example.com/redirector", "markdown")
+
+    def test_safe_redirect_is_followed(self, monkeypatch):
+        import httpx
+        _force_available(monkeypatch, True)
+
+        def handler(request):
+            if request.url.path == "/a":
+                return httpx.Response(301, headers={"location": "https://example.org/b"})
+            return httpx.Response(
+                200,
+                text="<html><body><article>Hello world, article body for extraction.</article></body></html>",
+            )
+
+        self._patch_httpx(monkeypatch, handler)
+        monkeypatch.setattr("plugins.web.trafilatura.provider.is_safe_url", lambda u: True)
+        p = TrafilaturaWebExtractProvider()
+        result = p._fetch_markdown("https://example.com/a", "markdown")
+        assert result["final_url"] == "https://example.org/b"
+
+    def test_redirect_loop_is_capped(self, monkeypatch):
+        import httpx
+        _force_available(monkeypatch, True)
+
+        self._patch_httpx(
+            monkeypatch,
+            lambda request: httpx.Response(302, headers={"location": "https://example.com/loop"}),
+        )
+        monkeypatch.setattr("plugins.web.trafilatura.provider.is_safe_url", lambda u: True)
+        p = TrafilaturaWebExtractProvider()
+        with pytest.raises(RuntimeError, match="too many redirects"):
+            p._fetch_markdown("https://example.com/loop", "markdown")

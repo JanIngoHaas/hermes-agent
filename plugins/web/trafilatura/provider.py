@@ -13,12 +13,14 @@ local/offline extract backend alongside the hosted ones (firecrawl, tavily,
 exa, parallel).
 
 Fetching: unlike the hosted providers (which fetch from vendor infrastructure),
-trafilatura fetches from the local host, so this provider re-applies the SSRF
-guard (:func:`tools.url_safety.is_safe_url`) and the website-access policy
-(:func:`tools.website_policy.check_website_access`) to the *final* URL after
-redirects — mirroring the firecrawl provider's redirect-aware re-check. The
-initial SSRF filter on the requested URLs is already applied by the
-``web_extract`` tool wrapper before dispatch.
+trafilatura fetches from the local host, so SSRF defence matters here. Redirects
+are followed *manually* with :func:`tools.url_safety.is_safe_url` applied to
+every hop *before* the next request is issued — httpx's auto-redirect would fire
+the request at a redirected-to internal address before it could be validated
+(blind SSRF). The final URL is additionally re-checked against ``is_safe_url``
+and the website-access policy (:func:`tools.website_policy.check_website_access`)
+in :meth:`extract`. The initial SSRF filter on the requested URLs is already
+applied by the ``web_extract`` tool wrapper before dispatch.
 
 Output: returns the FULL clean Markdown per page (no truncation). Oversized
 pages are compressed downstream by the ``web_extract`` tool's
@@ -54,6 +56,10 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 HermesBot/1.0"
 )
 _FETCH_TIMEOUT = 60
+# Cap manual redirect following. Each hop is SSRF-validated before the next
+# request is issued (see _fetch_markdown); this just bounds redirect loops.
+_MAX_REDIRECTS = 10
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
 
 
 def _blocked_result(url: str, title: str, blocked: Dict[str, Any]) -> Dict[str, Any]:
@@ -123,16 +129,36 @@ class TrafilaturaWebExtractProvider(WebSearchProvider):
             raise ImportError(str(exc))
 
         import trafilatura
+        from urllib.parse import urljoin
 
+        # Follow redirects MANUALLY so every hop is SSRF-checked *before* the
+        # request is issued. httpx's follow_redirects=True would fire the GET
+        # at a redirected-to internal address before we could validate it
+        # (blind SSRF) and never validates intermediate hops. is_safe_url is
+        # already applied to the initial URL by the web_extract wrapper.
+        current_url = url
         with httpx.Client(
-            follow_redirects=True,
+            follow_redirects=False,
             timeout=_FETCH_TIMEOUT,
             headers={"User-Agent": _USER_AGENT, "Accept": "text/html,*/*"},
         ) as client:
-            resp = client.get(url)
+            for _ in range(_MAX_REDIRECTS + 1):
+                resp = client.get(current_url)
+                if resp.status_code in _REDIRECT_CODES and "location" in resp.headers:
+                    next_url = urljoin(current_url, resp.headers["location"])
+                    if not is_safe_url(next_url):
+                        raise RuntimeError(
+                            "blocked redirect to a private or internal network "
+                            f"address: {next_url}"
+                        )
+                    current_url = next_url
+                    continue
+                break
+            else:
+                raise RuntimeError(f"too many redirects (> {_MAX_REDIRECTS})")
             resp.raise_for_status()
 
-        final_url = str(resp.url)
+        final_url = current_url
         html = resp.text
 
         # FULL content — no truncation. The web_extract wrapper's auxiliary
