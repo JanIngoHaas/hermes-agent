@@ -240,6 +240,22 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             msg = msg[:17] + "..."
         return f"to {target}: \"{msg}\""
 
+    if tool_name == "web_extract":
+        urls = args.get("urls")
+        if isinstance(urls, list):
+            url = urls[0] if urls else ""
+        else:
+            url = urls or ""
+        url = _oneline(str(url))
+        if max_len > 0 and len(url) > max_len:
+            url = url[:max_len - 3] + "..."
+        question = _oneline(str(args.get("question", "")))
+        if question:
+            if len(question) > 40:
+                question = question[:37] + "..."
+            return f"{url} — \"{question}\"" if url else f"\"{question}\""
+        return url or None
+
     key = primary_args.get(tool_name)
     if not key:
         for fallback_key in ("query", "text", "command", "path", "name", "prompt", "code", "goal"):
