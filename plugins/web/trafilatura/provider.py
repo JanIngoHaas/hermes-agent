@@ -23,8 +23,10 @@ in :meth:`extract`. The initial SSRF filter on the requested URLs is already
 applied by the ``web_extract`` tool wrapper before dispatch.
 
 Output: returns the FULL clean Markdown per page (no truncation). Oversized
-pages are compressed downstream by the ``web_extract`` tool's
-``auxiliary.web_extract`` summarizer, exactly as for the other backends.
+pages are handled downstream by the ``web_extract`` tool: by default they are
+head+tail truncated with the full text stored to disk (no LLM call), and only
+when the caller passes ``question`` does a single auxiliary-model pass narrow
+the page to what answers it — exactly as for the other backends.
 
 Config::
 
@@ -35,6 +37,8 @@ Config::
 Async note: ``extract()`` is ``async def``; each URL's blocking fetch +
 parse runs in :func:`asyncio.to_thread` under a 60s
 :func:`asyncio.wait_for` guard so a hung or huge page can't block the loop.
+All URLs in one call are fetched concurrently via :func:`asyncio.gather`, so
+an N-URL extract costs one page's latency, not N.
 """
 
 from __future__ import annotations
@@ -161,8 +165,9 @@ class TrafilaturaWebExtractProvider(WebSearchProvider):
         final_url = current_url
         html = resp.text
 
-        # FULL content — no truncation. The web_extract wrapper's auxiliary
-        # summarizer compresses oversized pages downstream.
+        # FULL content — no truncation. The web_extract wrapper decides how
+        # to bound it downstream (truncate-and-store, or a question-directed
+        # auxiliary pass when the caller asked for one).
         content = trafilatura.extract(
             html,
             output_format=output_format,
@@ -207,17 +212,16 @@ class TrafilaturaWebExtractProvider(WebSearchProvider):
             ]
 
         output_format = "html" if kwargs.get("format") == "html" else "markdown"
-        results: List[Dict[str, Any]] = []
 
-        for url in urls:
+        async def _one(url: str) -> Dict[str, Any]:
+            """Fetch + extract a single URL. Never raises — errors become results."""
             # Pre-fetch website-policy gate.
             blocked = check_website_access(url)
             if blocked:
                 logger.info(
                     "Blocked web_extract for %s by rule %s", blocked["host"], blocked["rule"]
                 )
-                results.append(_blocked_result(url, "", blocked))
-                continue
+                return _blocked_result(url, "", blocked)
 
             try:
                 logger.info("Trafilatura extract: %s", url)
@@ -227,39 +231,33 @@ class TrafilaturaWebExtractProvider(WebSearchProvider):
                 )
             except asyncio.TimeoutError:
                 logger.warning("Trafilatura fetch timed out for %s", url)
-                results.append(
-                    {
-                        "url": url,
-                        "title": "",
-                        "content": "",
-                        "error": (
-                            f"Fetch timed out after {_FETCH_TIMEOUT}s — page may be too "
-                            "large or unresponsive. Try browser_navigate instead."
-                        ),
-                    }
-                )
-                continue
+                return {
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "error": (
+                        f"Fetch timed out after {_FETCH_TIMEOUT}s — page may be too "
+                        "large or unresponsive. Try browser_navigate instead."
+                    ),
+                }
             except Exception as exc:  # noqa: BLE001 — surface fetch/parse errors per-URL
                 logger.debug("Trafilatura fetch failed for %s: %s", url, exc)
-                results.append(
-                    {"url": url, "title": "", "content": "", "error": f"trafilatura fetch failed: {exc}"}
-                )
-                continue
+                return {
+                    "url": url, "title": "", "content": "",
+                    "error": f"trafilatura fetch failed: {exc}",
+                }
 
             final_url = fetched["final_url"]
             title = fetched["title"]
 
             # Redirect-aware SSRF + website-policy re-check on the final URL.
             if not is_safe_url(final_url):
-                results.append(
-                    {
-                        "url": final_url,
-                        "title": "",
-                        "content": "",
-                        "error": "Blocked: redirected to a private or internal network address",
-                    }
-                )
-                continue
+                return {
+                    "url": final_url,
+                    "title": "",
+                    "content": "",
+                    "error": "Blocked: redirected to a private or internal network address",
+                }
             final_blocked = check_website_access(final_url)
             if final_blocked:
                 logger.info(
@@ -267,34 +265,51 @@ class TrafilaturaWebExtractProvider(WebSearchProvider):
                     final_blocked["host"],
                     final_blocked["rule"],
                 )
-                results.append(_blocked_result(final_url, title, final_blocked))
-                continue
+                return _blocked_result(final_url, title, final_blocked)
 
             content = fetched["markdown"]
             if not content.strip():
-                results.append(
-                    {
-                        "url": final_url,
-                        "title": title,
-                        "content": "",
-                        "error": (
-                            "No extractable content found (trafilatura returned empty). "
-                            "The page may be JS-rendered or a non-HTML document (e.g. PDF) — "
-                            "try browser_navigate instead."
-                        ),
-                    }
-                )
-                continue
-
-            results.append(
-                {
+                return {
                     "url": final_url,
                     "title": title,
-                    "content": content,
-                    "raw_content": content,
-                    "metadata": {"source": "trafilatura", "sourceURL": final_url},
+                    "content": "",
+                    "error": (
+                        "No extractable content found (trafilatura returned empty). "
+                        "The page may be JS-rendered or a non-HTML document (e.g. PDF) — "
+                        "try browser_navigate instead."
+                    ),
                 }
-            )
+
+            return {
+                "url": final_url,
+                "title": title,
+                "content": content,
+                "raw_content": content,
+                "metadata": {"source": "trafilatura", "sourceURL": final_url},
+            }
+
+        # Fetch all URLs concurrently. Sequential awaits made an N-URL call
+        # cost N x _FETCH_TIMEOUT in the worst case (web_extract allows 5),
+        # while every hosted backend fetches its pages in parallel. Each page
+        # is an independent network wait, so gather is a straight win.
+        # return_exceptions=True: an unforeseen failure in one page must not
+        # discard the others; it is reported in that page's slot instead.
+        settled = await asyncio.gather(
+            *(_one(u) for u in urls), return_exceptions=True
+        )
+
+        results: List[Dict[str, Any]] = []
+        for url, item in zip(urls, settled):
+            if isinstance(item, BaseException):
+                logger.debug("Trafilatura extract task failed for %s: %s", url, item)
+                results.append(
+                    {
+                        "url": url, "title": "", "content": "",
+                        "error": f"trafilatura extract failed: {item}",
+                    }
+                )
+            else:
+                results.append(item)
 
         return results
 

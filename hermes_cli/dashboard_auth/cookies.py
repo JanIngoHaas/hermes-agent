@@ -2,24 +2,39 @@
 
 Three cookies in play:
   - hermes_session_at:   the OAuth access token
-                         (HttpOnly, lifetime = token TTL)
+                         (HttpOnly, lifetime = token TTL, ~15 min)
   - hermes_session_rt:   the OAuth refresh token
-                         (HttpOnly, lifetime = 30 days)
-                         **DEPRECATED in OAuth contract v1** — Nous Portal
-                         does not issue refresh tokens; we keep the cookie
-                         name and clear semantics for forward compatibility
-                         and to flush stale cookies from old browsers.
+                         (HttpOnly, lifetime = 24h, ROTATING + reuse-detected)
+                         Nous Portal issues a rotating refresh token for the
+                         dashboard auth-code grant (Portal NAS #293 / hermes
+                         #37247). ``set_session_cookies`` writes this cookie
+                         whenever the provider returns a non-empty
+                         ``refresh_token``; the middleware uses it to rotate a
+                         fresh access token transparently on AT expiry. A
+                         provider that omits the refresh token (empty string)
+                         degrades gracefully to access-token-only sessions —
+                         the RT cookie is simply not written.
   - hermes_session_pkce: short-lived PKCE state + CSRF nonce + provider
                          hint (HttpOnly, lifetime = 10 minutes)
 
-All three are ``SameSite=Lax`` (browser will send on cross-site GET
-top-level navigation, which we need for the IDP redirect back to
-``/auth/callback``) and live under the prefix's Path. ``Secure`` is set
-ONLY when the dashboard was reached over HTTPS — detected via the
-request URL scheme, which honours ``X-Forwarded-Proto`` upstream of
-Fly's TLS terminator when uvicorn is configured with
-``proxy_headers=True``. Loopback dev traffic is always HTTP so
-``Secure`` would lock the cookies out of the browser.
+The two session cookies are ``SameSite=Lax`` and live under the prefix's
+Path. The PKCE cookie is the exception: ``SameSite=None`` over HTTPS,
+falling back to ``Lax`` on plain HTTP (where ``SameSite=None`` is invalid
+without ``Secure``). It is set on the ``/auth/login`` 302 and must survive
+the cross-site redirect chain out to the IDP and back to
+``/auth/callback``; Chromium intermittently drops ``Lax`` cookies set on a
+302 in such a chain (crbug 40508226), which surfaces as "Missing PKCE
+state cookie". ``Secure`` is set ONLY when the dashboard was reached over
+HTTPS — detected via the request URL scheme, which honours
+``X-Forwarded-Proto`` upstream of Fly's TLS terminator when uvicorn is
+configured with ``proxy_headers=True``. Loopback dev traffic is always
+HTTP so ``Secure`` would lock the cookies out of the browser.
+
+NOTE: uvicorn only honours ``X-Forwarded-Proto`` from a peer inside its
+``forwarded_allow_ips`` (default: ``127.0.0.1``). A TLS terminator that
+reaches the dashboard from a non-loopback address — e.g. a reverse proxy
+in its own container — is not trusted, so the request still looks like
+HTTP here and these cookies are written in their HTTP shape.
 
 Cookie prefix selection (browser hardening per
 https://datatracker.ietf.org/doc/html/draft-west-cookie-prefixes):
@@ -39,17 +54,19 @@ The setters and readers BOTH consult the active prefix because the
 cookie *name* changes — a reader that looked up the bare name when the
 setter wrote ``__Secure-hermes_session_at`` would never find the value.
 
-.. deprecated:: contract v1
-   ``set_session_cookies`` accepts ``refresh_token=""`` (the contract-v1
-   default) and silently skips writing the RT cookie in that case.
-   ``clear_session_cookies`` still emits a Max-Age=0 deletion for the RT
-   cookie so users carrying a stale cookie from an earlier deployment get
-   it cleared on logout / session expiry. The full refresh-flow machinery
-   was rewritten as "401 → redirect to /login" in Phase 6.
+Refresh-token handling:
+   ``set_session_cookies`` accepts ``refresh_token=""`` (provider omitted
+   it) and silently skips writing the RT cookie in that case, so a
+   refresh-token-less provider degrades to access-token-only sessions.
+   ``clear_session_cookies`` always emits a Max-Age=0 deletion for the RT
+   cookie on logout / session expiry so a stale cookie from an earlier
+   deployment gets cleared. The transparent rotation flow ("expired AT +
+   live RT → rotate server-side, else 401 → /login") lives in
+   ``middleware._attempt_refresh``.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import Response
@@ -59,16 +76,42 @@ from fastapi.responses import Response
 # request's HTTPS + prefix combination.
 SESSION_AT_COOKIE = "hermes_session_at"
 SESSION_RT_COOKIE = "hermes_session_rt"
+# Provider that minted the session. This non-secret routing hint prevents a
+# refresh token from being handed to the wrong provider when several dashboard
+# auth plugins are enabled (for example Basic + Nous OAuth).
+SESSION_PROVIDER_COOKIE = "hermes_session_provider"
 PKCE_COOKIE = "hermes_session_pkce"
+# One-shot loop-guard marker for the auto-SSO redirect (Phase 1,
+# cloud-auto-discovery). Set when the gate auto-initiates the portal OAuth
+# redirect on an unauthenticated document load; its mere PRESENCE on the next
+# unauthenticated load tells the gate "we already bounced once" so a genuinely
+# absent portal session degrades to the /login page instead of ping-ponging.
+# Carries no secret — it's a boolean breadcrumb — but is set HttpOnly/Lax/Secure
+# like the others for consistency. Short TTL so a user who returns later gets a
+# fresh silent attempt rather than a permanently-disabled one.
+SSO_ATTEMPT_COOKIE = "hermes_sso_attempt"
 
 # Possible name variants we may have to read back. Sorted so most-strict
 # wins on iteration when both happen to be present (shouldn't happen in
 # practice — a single request emits exactly one variant).
 _NAME_VARIANTS = ("__Host-", "__Secure-", "")
 
-# 30 days — matches Portal's REFRESH_TOKEN_TTL_SECONDS
+# RT cookie Max-Age. Kept at 30 days as a generous upper bound on the cookie's
+# browser lifetime; Portal's actual refresh-token TTL (24h, rotating) is the
+# real authority — once the RT itself expires/rotates out, a refresh attempt
+# returns 400 → RefreshExpiredError → clean re-login, regardless of how long
+# the cookie lingers. (Not tightened to 24h here to avoid coupling the cookie
+# lifetime to a server-side TTL that can change independently; revisit if the
+# stale-cookie refresh churn ever matters.)
 _RT_MAX_AGE = 30 * 24 * 60 * 60
 _PKCE_MAX_AGE = 10 * 60
+# Auto-SSO loop-guard marker TTL. Just long enough to cover one redirect
+# round trip to the portal and back (a few seconds in practice); kept at 60s
+# so a slow portal hop or a manual back-button still trips the guard, while a
+# user returning minutes later gets a fresh silent attempt rather than being
+# stuck on /login forever. The marker is also cleared explicitly on a
+# successful callback and whenever the gate falls back to /login.
+_SSO_ATTEMPT_MAX_AGE = 60
 
 
 def _resolved_name(bare: str, *, use_https: bool, prefix: str) -> str:
@@ -112,6 +155,24 @@ def _common_attrs(*, use_https: bool, prefix: str) -> dict:
     return attrs
 
 
+def set_session_provider_cookie(
+    response: Response,
+    *,
+    provider: str,
+    use_https: bool,
+    prefix: str = "",
+) -> None:
+    """Persist the non-secret provider routing hint for token refresh."""
+    if not provider:
+        return
+    response.set_cookie(
+        _resolved_name(SESSION_PROVIDER_COOKIE, use_https=use_https, prefix=prefix),
+        provider,
+        max_age=_RT_MAX_AGE,
+        **_common_attrs(use_https=use_https, prefix=prefix),
+    )
+
+
 def set_session_cookies(
     response: Response,
     *,
@@ -120,17 +181,18 @@ def set_session_cookies(
     access_token_expires_in: int,
     use_https: bool,
     prefix: str = "",
+    provider: str = "",
 ) -> None:
     """Set the session cookies on the response.
 
     ``access_token_expires_in`` is in seconds. Use the provider's reported
     TTL for the access token.
 
-    ``refresh_token`` is accepted for backward / forward compatibility but
-    SKIPPED when empty — Nous Portal contract v1 issues no refresh tokens
-    so a ``Session.refresh_token == ""`` from the provider means we don't
-    persist anything. If a future contract revision starts emitting refresh
-    tokens, this helper will write the RT cookie again with no other change.
+    ``refresh_token`` is written as the RT cookie when non-empty. Nous Portal
+    issues a 24h rotating refresh token (hermes #37247); a provider that
+    omits it returns ``Session.refresh_token == ""`` and we simply don't
+    persist the RT cookie — the session then behaves as access-token-only
+    until the AT expires. No other branch changes between the two cases.
 
     ``prefix`` is the normalised X-Forwarded-Prefix value (e.g. ``/hermes``)
     or ``""`` for a direct deploy. It influences both the cookie name
@@ -152,6 +214,52 @@ def set_session_cookies(
             max_age=_RT_MAX_AGE,
             **_common_attrs(use_https=use_https, prefix=prefix),
         )
+    set_session_provider_cookie(
+        response,
+        provider=provider,
+        use_https=use_https,
+        prefix=prefix,
+    )
+
+
+def _clear_cookie_variants(
+    response: Response,
+    bare_name: str,
+    *,
+    prefix: str,
+    https_samesite: Literal["lax", "strict", "none"],
+    bare_attrs: dict,
+) -> None:
+    """Emit Max-Age=0 deletions for every plausible name variant of a cookie.
+
+    Cookie-prefix rules make the deletion shape load-bearing: a Set-Cookie
+    for a ``__Host-``/``__Secure-`` name is rejected outright by the
+    browser unless it carries ``Secure`` (and ``__Host-`` additionally
+    requires ``Path=/``), so those deletions always carry the attributes
+    their name demands. The bare-name deletion mirrors the shape the
+    setter uses (``bare_attrs``) — under RFC 6265bis a deletion sent from
+    a secure origin may omit ``Secure`` and still delete a Secure cookie,
+    while a ``Secure`` deletion on a plain-HTTP origin can be ignored, so
+    matching the setter is the shape that works on both origins.
+    """
+    for variant in _NAME_VARIANTS:
+        if variant == "__Host-":
+            # __Host- demands Secure AND Path=/ or the header is invalid.
+            response.set_cookie(
+                f"{variant}{bare_name}", "", max_age=0,
+                path="/", httponly=True, samesite=https_samesite,
+                secure=True,
+            )
+        elif variant == "__Secure-":
+            response.set_cookie(
+                f"{variant}{bare_name}", "", max_age=0,
+                path=_cookie_path(prefix), httponly=True,
+                samesite=https_samesite, secure=True,
+            )
+        else:
+            response.set_cookie(
+                bare_name, "", max_age=0, **bare_attrs,
+            )
 
 
 def clear_session_cookies(response: Response, *, prefix: str = "") -> None:
@@ -163,36 +271,69 @@ def clear_session_cookies(response: Response, *, prefix: str = "") -> None:
     depends on the request that set it), so we emit deletions for every
     plausible variant under the active path.
     """
-    path = _cookie_path(prefix)
-    for variant in _NAME_VARIANTS:
-        response.set_cookie(
-            f"{variant}{SESSION_AT_COOKIE}", "", max_age=0,
-            path=path, httponly=True, samesite="lax",
+    bare_attrs = {
+        "path": _cookie_path(prefix), "httponly": True, "samesite": "lax",
+    }
+    for name in (SESSION_AT_COOKIE, SESSION_RT_COOKIE, SESSION_PROVIDER_COOKIE):
+        _clear_cookie_variants(
+            response, name,
+            prefix=prefix, https_samesite="lax", bare_attrs=bare_attrs,
         )
-        response.set_cookie(
-            f"{variant}{SESSION_RT_COOKIE}", "", max_age=0,
-            path=path, httponly=True, samesite="lax",
-        )
+
+
+def _pkce_attrs(*, use_https: bool, prefix: str) -> dict:
+    """Cookie attributes for the PKCE cookie's set AND clear paths.
+
+    Single source of truth so a deletion always matches the shape the
+    setter emitted for the same origin — a shape mismatch means the
+    browser silently keeps the stale cookie.
+    """
+    attrs = _common_attrs(use_https=use_https, prefix=prefix)
+    if use_https:
+        attrs["samesite"] = "none"
+    return attrs
 
 
 def set_pkce_cookie(
     response: Response, *, payload: str, use_https: bool, prefix: str = "",
 ) -> None:
+    # SameSite=None when HTTPS: the PKCE cookie is set on the /auth/login
+    # 302 response (redirecting to the IDP) and must survive the cross-site
+    # redirect chain (same-site → IDP → same-site callback). Chromium has a
+    # long-standing bug (crbug 40508226) where SameSite=Lax cookies set on a
+    # 302 in a cross-site redirect chain are intermittently dropped, causing
+    # "Missing PKCE state cookie" on the callback. SameSite=None + Secure
+    # sidesteps the bug — these cookies are explicitly designed for cross-site
+    # delivery and Chromium processes them reliably during redirects.
+    # Loopback HTTP degrades to Lax (SameSite=None requires Secure).
     response.set_cookie(
         _resolved_name(PKCE_COOKIE, use_https=use_https, prefix=prefix),
         payload,
         max_age=_PKCE_MAX_AGE,
-        **_common_attrs(use_https=use_https, prefix=prefix),
+        **_pkce_attrs(use_https=use_https, prefix=prefix),
     )
 
 
-def clear_pkce_cookie(response: Response, *, prefix: str = "") -> None:
-    path = _cookie_path(prefix)
-    for variant in _NAME_VARIANTS:
-        response.set_cookie(
-            f"{variant}{PKCE_COOKIE}", "", max_age=0,
-            path=path, httponly=True, samesite="lax",
-        )
+def clear_pkce_cookie(
+    response: Response, *, use_https: bool, prefix: str = "",
+) -> None:
+    """Emit Max-Age=0 deletions for every plausible PKCE cookie variant.
+
+    A deletion is only honoured when its shape is acceptable to the
+    browser on the current origin: a ``Secure`` deletion can be dropped
+    on a plain-HTTP origin, while the ``__Host-``/``__Secure-`` name
+    variants REQUIRE ``Secure`` to be valid at all. So the bare-name
+    deletion mirrors the setter's shape for the active origin (Lax
+    without ``Secure`` over HTTP; ``SameSite=None; Secure`` over HTTPS,
+    matching :func:`set_pkce_cookie`), and the prefixed variants — which
+    can only ever have been set on an HTTPS origin — always carry
+    ``Secure; SameSite=None``.
+    """
+    _clear_cookie_variants(
+        response, PKCE_COOKIE,
+        prefix=prefix, https_samesite="none",
+        bare_attrs=_pkce_attrs(use_https=use_https, prefix=prefix),
+    )
 
 
 def _read_with_fallback(
@@ -219,8 +360,51 @@ def read_session_cookies(request: Request) -> Tuple[Optional[str], Optional[str]
     return at, rt
 
 
+def read_session_provider(request: Request) -> Optional[str]:
+    """Return the provider routing hint associated with the session cookies."""
+    return _read_with_fallback(request, SESSION_PROVIDER_COOKIE)
+
+
 def read_pkce_cookie(request: Request) -> Optional[str]:
     return _read_with_fallback(request, PKCE_COOKIE)
+
+
+def set_sso_attempt_cookie(
+    response: Response, *, use_https: bool, prefix: str = "",
+) -> None:
+    """Set the one-shot auto-SSO loop-guard marker (Phase 1).
+
+    Written by the gate the moment it auto-initiates the portal OAuth
+    redirect on an unauthenticated document load. The value is a constant
+    (``"1"``) — only its presence matters. Short Max-Age so a stale marker
+    can't permanently suppress a future silent attempt.
+    """
+    response.set_cookie(
+        _resolved_name(SSO_ATTEMPT_COOKIE, use_https=use_https, prefix=prefix),
+        "1",
+        max_age=_SSO_ATTEMPT_MAX_AGE,
+        **_common_attrs(use_https=use_https, prefix=prefix),
+    )
+
+
+def read_sso_attempt_cookie(request: Request) -> Optional[str]:
+    """Return the auto-SSO marker value if present (any variant), else None."""
+    return _read_with_fallback(request, SSO_ATTEMPT_COOKIE)
+
+
+def clear_sso_attempt_cookie(response: Response, *, prefix: str = "") -> None:
+    """Emit Max-Age=0 deletions for the auto-SSO marker, every name variant.
+
+    Called on a successful callback and whenever the gate falls back to
+    /login, so the marker never lingers to suppress a later silent attempt.
+    """
+    _clear_cookie_variants(
+        response, SSO_ATTEMPT_COOKIE,
+        prefix=prefix, https_samesite="lax",
+        bare_attrs={
+            "path": _cookie_path(prefix), "httponly": True, "samesite": "lax",
+        },
+    )
 
 
 def detect_https(request: Request) -> bool:

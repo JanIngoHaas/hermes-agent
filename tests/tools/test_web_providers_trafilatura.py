@@ -191,14 +191,30 @@ class TestTrafilaturaRegistryIntegration:
 
 
 class TestTrafilaturaBackendWiring:
+    """Availability now flows through the plugin registry seam.
+
+    Upstream generalized ``_is_backend_available``: any backend outside
+    ``_LEGACY_WEB_BACKENDS`` delegates to the registered provider's
+    ``is_available()``. trafilatura is plugin-registered, so we patch that
+    seam rather than a trafilatura-specific probe (which no longer exists).
+    """
+
+    @staticmethod
+    def _patch_availability(monkeypatch, web_tools, available: bool):
+        monkeypatch.setattr(
+            web_tools,
+            "_registered_web_provider_available",
+            lambda backend: available if backend == "trafilatura" else None,
+        )
+
     def test_is_backend_available_true_when_package_importable(self, monkeypatch):
         from tools import web_tools
-        monkeypatch.setattr(web_tools, "_trafilatura_package_importable", lambda: True)
+        self._patch_availability(monkeypatch, web_tools, True)
         assert web_tools._is_backend_available("trafilatura") is True
 
     def test_is_backend_available_false_when_package_missing(self, monkeypatch):
         from tools import web_tools
-        monkeypatch.setattr(web_tools, "_trafilatura_package_importable", lambda: False)
+        self._patch_availability(monkeypatch, web_tools, False)
         assert web_tools._is_backend_available("trafilatura") is False
 
     def test_configured_extract_backend_resolves_to_trafilatura(self, monkeypatch):
@@ -208,17 +224,33 @@ class TestTrafilaturaBackendWiring:
             web_tools, "_load_web_config",
             lambda: {"backend": "ddgs", "search_backend": "ddgs", "extract_backend": "trafilatura"},
         )
-        monkeypatch.setattr(web_tools, "_trafilatura_package_importable", lambda: True)
+        self._patch_availability(monkeypatch, web_tools, True)
         assert web_tools._get_extract_backend() == "trafilatura"
 
-    def test_unavailable_extract_backend_falls_back(self, monkeypatch):
-        """If trafilatura isn't installed, extract selection falls back to shared backend."""
+    def test_unavailable_extract_backend_is_still_honored(self, monkeypatch):
+        """A stored extract_backend wins even when unavailable (strict selection).
+
+        Upstream made per-capability selection strict on purpose: a
+        selected-but-broken backend must surface the vendor path's honest
+        error rather than being silently swapped for whatever the
+        credential ladder finds. This previously asserted a fallback to
+        the shared backend; that behavior is gone by design.
+        """
         from tools import web_tools
         monkeypatch.setattr(
             web_tools, "_load_web_config",
             lambda: {"backend": "firecrawl", "search_backend": "", "extract_backend": "trafilatura"},
         )
-        monkeypatch.setattr(web_tools, "_trafilatura_package_importable", lambda: False)
+        self._patch_availability(monkeypatch, web_tools, False)
+        assert web_tools._get_extract_backend() == "trafilatura"
+
+    def test_extract_backend_falls_through_to_shared_when_unset(self, monkeypatch):
+        """With no per-capability override stored, the shared backend is used."""
+        from tools import web_tools
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"backend": "firecrawl", "search_backend": "", "extract_backend": ""},
+        )
         assert web_tools._get_extract_backend() == "firecrawl"
 
 
@@ -311,3 +343,151 @@ class TestFetchMarkdownRedirectSSRF:
         p = TrafilaturaWebExtractProvider()
         with pytest.raises(RuntimeError, match="too many redirects"):
             p._fetch_markdown("https://loop.example.com/x", "markdown")
+
+
+# ---------------------------------------------------------------------------
+# extract() fetches URLs concurrently, not one after another
+# ---------------------------------------------------------------------------
+
+
+class TestExtractConcurrency:
+    def test_multiple_urls_are_fetched_concurrently(self, monkeypatch):
+        """N URLs must cost ~one page's latency, not N pages'.
+
+        Regression guard: extract() used to await each URL in a plain for
+        loop, so a 5-URL call (web_extract's max) could serialize into
+        5 x _FETCH_TIMEOUT in the worst case.
+        """
+        import asyncio as _asyncio
+        import time
+        from plugins.web.trafilatura.provider import TrafilaturaWebExtractProvider
+
+        provider = TrafilaturaWebExtractProvider()
+        monkeypatch.setattr(
+            "plugins.web.trafilatura.provider.check_website_access", lambda url: None
+        )
+        monkeypatch.setattr(
+            "plugins.web.trafilatura.provider.is_safe_url", lambda url: True
+        )
+
+        DELAY = 0.25
+        urls = [f"https://example.com/{i}" for i in range(5)]
+
+        def _slow_fetch(url, output_format):
+            time.sleep(DELAY)
+            return {"markdown": f"# page {url}", "title": "t", "final_url": url}
+
+        monkeypatch.setattr(provider, "_fetch_markdown", _slow_fetch)
+
+        started = time.monotonic()
+        results = _asyncio.run(provider.extract(urls))
+        elapsed = time.monotonic() - started
+
+        assert [r["url"] for r in results] == urls, "result order must match input order"
+        assert all(r.get("content") for r in results)
+        # Sequential would be >= 5 * DELAY; concurrent stays near one DELAY.
+        assert elapsed < DELAY * 3, (
+            f"extract() appears to serialize: {elapsed:.2f}s for {len(urls)} URLs "
+            f"at {DELAY}s each (concurrent should be ~{DELAY}s)"
+        )
+
+    def test_one_failing_url_does_not_discard_the_others(self, monkeypatch):
+        """A raising page is reported in its own slot; siblings still return."""
+        import asyncio as _asyncio
+        from plugins.web.trafilatura.provider import TrafilaturaWebExtractProvider
+
+        provider = TrafilaturaWebExtractProvider()
+        monkeypatch.setattr(
+            "plugins.web.trafilatura.provider.check_website_access", lambda url: None
+        )
+        monkeypatch.setattr(
+            "plugins.web.trafilatura.provider.is_safe_url", lambda url: True
+        )
+
+        def _fetch(url, output_format):
+            if url.endswith("bad"):
+                raise RuntimeError("boom")
+            return {"markdown": "# ok", "title": "t", "final_url": url}
+
+        monkeypatch.setattr(provider, "_fetch_markdown", _fetch)
+
+        urls = ["https://example.com/good", "https://example.com/bad"]
+        results = _asyncio.run(provider.extract(urls))
+
+        assert [r["url"] for r in results] == urls
+        assert results[0]["content"] == "# ok"
+        assert results[1]["error"]
+        assert not results[1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# An extract-only provider must never become the shared/search backend
+# ---------------------------------------------------------------------------
+
+
+class TestExtractOnlyProviderNotChosenForSearch:
+    """Regression: registering trafilatura hijacked the shared web backend.
+
+    ``_get_backend()``'s final plugin walk returned the first *available*
+    registered non-legacy provider without asking whether it can search.
+    trafilatura is extract-only, so on a never-configured install with the
+    package present it won the shared slot, and ``_get_search_backend()``
+    (which falls through to ``_get_backend()``) resolved web_search to a
+    backend that cannot serve it.
+    """
+
+    def _unconfigured(self, monkeypatch, web_tools):
+        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.selection_exists", lambda _k: False
+        )
+        # No credentials for any built-in backend.
+        monkeypatch.setattr(web_tools, "_has_env", lambda _n: False)
+        monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
+        monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
+
+    def test_available_extract_only_provider_is_skipped(self, monkeypatch):
+        from tools import web_tools
+
+        class _ExtractOnly:
+            name = "trafilatura"
+            def supports_search(self): return False
+            def supports_extract(self): return True
+            def is_available(self): return True
+
+        self._unconfigured(monkeypatch, web_tools)
+        monkeypatch.setattr(
+            web_tools, "_list_registered_web_providers", lambda: [_ExtractOnly()]
+        )
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+
+        assert web_tools._get_backend() != "trafilatura"
+        assert web_tools._get_search_backend() != "trafilatura"
+
+    def test_search_capable_plugin_provider_is_still_chosen(self, monkeypatch):
+        """The walk must still find genuine search-capable plugin backends."""
+        from tools import web_tools
+
+        class _SearchCapable:
+            name = "custom-search"
+            def supports_search(self): return True
+            def supports_extract(self): return False
+            def is_available(self): return True
+
+        self._unconfigured(monkeypatch, web_tools)
+        monkeypatch.setattr(
+            web_tools, "_list_registered_web_providers", lambda: [_SearchCapable()]
+        )
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+
+        assert web_tools._get_backend() == "custom-search"
+
+    def test_extract_only_still_selectable_explicitly(self, monkeypatch):
+        """Explicit web.extract_backend remains the supported way to pick it."""
+        from tools import web_tools
+
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"backend": "", "extract_backend": "trafilatura"},
+        )
+        assert web_tools._get_extract_backend() == "trafilatura"
